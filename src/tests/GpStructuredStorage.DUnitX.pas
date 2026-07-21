@@ -1020,7 +1020,19 @@ end; { TGpStructuredStorageTests.FragmentationAcrossFatBlocksSurvivesCompact }
 procedure TGpStructuredStorageTests.DeletingFolderContainingSubfolderDoesNotUseFreedName;
 const
   CStorageFile = 'gss_test_thomasmueller.stg';
+  // Thomas Mueller's report specifically notes: "Deleting a folder tree with more than
+  // CMaxMRULength (10) sub-folders reliably triggers it". CMaxMRULength (a local const
+  // inside TGpStructuredFolderCache.TrimMRUList, not otherwise exposed) is the size of
+  // the folder cache's inactive-folder MRU list; once it holds more than 10 entries,
+  // TrimMRUList starts actually freeing whole TGpStructuredFolder objects (each pulling
+  // down its own TObjectList of entries) rather than just sitting idle. THAT is the churn
+  // that reliably clobbers the just-freed name string before entryName is read again - a
+  // single subfolder deletion frees only that one small string, which is very likely to
+  // still hold its old bytes by the time it's (mis)used, so a 1-subfolder tree can pass
+  // even with the bug present. Use enough subfolders to comfortably clear that threshold.
+  CSubfolderCount = 20;
 var
+  i      : integer;
   storage: IGpStructuredStorage;
 begin
   // Regression for the bug reported by Thomas Mueller (2026-07-20; see the version
@@ -1032,30 +1044,35 @@ begin
   // DeleteEntry went on to read entryName again at sfFolderCache_ref.Remove(Self,
   // entryName): a use-after-free that could silently corrupt the folder cache.
   //
-  // '/outer' containing exactly one subfolder ('/outer/inner') exercises exactly this
-  // path: deleting '/outer' recurses into DeleteAll, which deletes 'inner' via the
-  // aliased Entry[0].FileName call; 'inner' being a folder (not a file) is what reaches
-  // the Remove() call that used to read already-freed memory. Recreating '/outer'
-  // immediately afterwards checks that the folder cache wasn't left in a stale state by
-  // that read (the original failure mode was silent corruption, not necessarily a crash).
+  // '/outer' containing CSubfolderCount subfolders exercises exactly this path: deleting
+  // '/outer' recurses into DeleteAll, which deletes each subfolder via the aliased
+  // Entry[0].FileName call; each subfolder being a folder (not a file) is what reaches
+  // the Remove() call that used to read already-freed memory, and having more than
+  // CMaxMRULength of them is what reliably makes that read land on clobbered memory
+  // rather than incidentally-still-intact bytes. Recreating '/outer' immediately
+  // afterwards checks that the folder cache wasn't left in a stale state by that read
+  // (the original failure mode was silent corruption, not necessarily a crash).
   try
     storage := CreateStructuredStorage;
     storage.Initialize(CStorageFile, fmCreate);
     storage.CreateFolder('/outer');
-    storage.CreateFolder('/outer/inner');
-    storage.OpenFile('/outer/inner/f.dat', fmCreate).Free;
+    for i := 0 to CSubfolderCount - 1 do begin
+      storage.CreateFolder('/outer/sub' + IntToStr(i));
+      storage.OpenFile('/outer/sub' + IntToStr(i) + '/f.dat', fmCreate).Free;
+    end;
 
     storage.Delete('/outer'); // must not crash or corrupt the folder cache
 
     Assert.IsFalse(storage.FolderExists('/outer'), '/outer should be gone');
     storage.CreateFolder('/outer');
     Assert.IsTrue(storage.IsFolderEmpty('/outer'), 'freshly recreated /outer must be empty');
-    Assert.IsFalse(storage.FolderExists('/outer/inner'),
-      '/outer/inner must not resurface from stale folder-cache state');
+    for i := 0 to CSubfolderCount - 1 do
+      Assert.IsFalse(storage.FolderExists('/outer/sub' + IntToStr(i)),
+        Format('/outer/sub%d must not resurface from stale folder-cache state', [i]));
     storage.CreateFolder('/outer/inner');
     storage.OpenFile('/outer/inner/g.dat', fmCreate).Free;
     Assert.IsTrue(storage.FileExists('/outer/inner/g.dat'),
-      'the recreated /outer/inner must work independently');
+      'the recreated /outer must work independently');
   finally
     storage := nil;
     DeleteStorageFile(CStorageFile);
