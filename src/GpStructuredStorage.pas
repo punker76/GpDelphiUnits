@@ -276,7 +276,7 @@ uses
   Contnrs,
   Math,
   SyncObjs,
-  System.Types,
+  Types,
   GpStuff;
 
 const
