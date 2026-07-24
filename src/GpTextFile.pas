@@ -35,11 +35,14 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
    Author           : Primoz Gabrijelcic
    Creation date    : 1999-11-01
    Last modification: 2025-08-18
-   Version          : 5.0
+   Version          : 5.01
    Requires         : GpHugeF 4.0, GpTextStream 1.13, GpStuff 2.23
    </pre>
 *)(*
    History:
+     5.01: 2026-06-03
+       - Compiler logs deprecation warning if ResetEx or RewriteEx are used
+         on a TGpTextFile object.
      5.0: 2025-07-18
        - UTF-8 conversion routines support Unicode Plane 1.
        - Extracted UTF-8 conversion logic into unit GpTextUTF8.
@@ -387,6 +390,16 @@ type
       flags: TOpenFlags   {$IFDEF D4plus}= []{$ENDIF};
       bufferSize: integer {$IFDEF D4plus}= 0{$ENDIF};
       codePage: word      {$IFDEF D4plus}= 0{$ENDIF});
+    function    ResetEx(
+      blockSize: integer                {$IFDEF D4plus}= 1{$ENDIF};
+      bufferSize: integer               {$IFDEF D4plus}= 0{$ENDIF};
+      diskLockTimeout: integer          {$IFDEF D4plus}= 0{$ENDIF};
+      diskRetryDelay: integer           {$IFDEF D4plus}= 0{$ENDIF};
+      options: THFOpenOptions           {$IFDEF D4plus}= []{$ENDIF};
+      waitObject: THandle               {$IFDEF D4plus}= 0{$ENDIF};
+      numPrefetchBuffers: integer       {$IFDEF D4plus}= 20{$ENDIF};
+      numPrefetchBeforeBuffers: integer {$IFDEF D4plus}= 0{$ENDIF};
+      sharedCache: IHFPrefetchCache     {$IFDEF D4plus}= nil{$ENDIF}): THFError; reintroduce; deprecated 'Incorrect use. Use Reset or ResetSafe instead';
     function  ResetSafe(
       flags: TOpenFlags        {$IFDEF D4plus}= []{$ENDIF};
       bufferSize: integer      {$IFDEF D4plus}= 0{$ENDIF};
@@ -398,6 +411,13 @@ type
       flags: TCreateFlags {$IFDEF D4plus}= []{$ENDIF};
       bufferSize: integer {$IFDEF D4plus}= 0{$ENDIF};
       codePage: word      {$IFDEF D4plus}= 0{$ENDIF});
+    function    RewriteEx(
+      blockSize: integer          {$IFDEF D4plus}= 1{$ENDIF};
+      bufferSize: integer         {$IFDEF D4plus}= 0{$ENDIF};
+      diskLockTimeout: integer    {$IFDEF D4plus}= 0{$ENDIF};
+      diskRetryDelay: integer     {$IFDEF D4plus}= 0{$ENDIF};
+      options: THFOpenOptions     {$IFDEF D4plus}= []{$ENDIF};
+      waitObject: THandle         {$IFDEF D4plus}= 0{$ENDIF}): THFError; reintroduce; deprecated 'Incorrect use. Use Rewrite or RewriteSafe instead';
     function  RewriteSafe(
       flags: TCreateFlags      {$IFDEF D4plus}= []{$ENDIF};
       bufferSize: integer      {$IFDEF D4plus}= 0{$ENDIF};
@@ -897,7 +917,7 @@ begin
     options := [hfoBuffered, hfoCanCreate];
     if cfCompressed in flags then
       Include(options, hfoCompressed);
-    Result := ResetEx(1, bufferSize, diskLockTimeout, diskRetryDelay, options, waitObject);
+    Result := inherited ResetEx(1, bufferSize, diskLockTimeout, diskRetryDelay, options, waitObject);
     if Result = hfOK then begin
       tfCFlags := [];
       if FileSize >= SizeOf(UCS4Char) then begin
@@ -1446,6 +1466,15 @@ begin
     raise EGpTextFile.CreateFmtHelp(sFailedToResetFile,[FileName],hcTFFailedToReset);
 end; { TGpTextFile.Reset }
 
+function TGpTextFile.ResetEx(blockSize, bufferSize, diskLockTimeout,
+  diskRetryDelay: integer; options: THFOpenOptions; waitObject: THandle;
+  numPrefetchBuffers, numPrefetchBeforeBuffers: integer;
+  sharedCache: IHFPrefetchCache): THFError;
+begin
+  Result := inherited ResetEx(blockSize, bufferSize, diskLockTimeout, diskRetryDelay,
+    options, waitObject, numPrefetchBuffers, numPrefetchBeforeBuffers, sharedCache);
+end; { TGpTextFile.ResetEx }
+
 {:Full form of Reset. Will retry if file is locked by another application (if
   diskLockTimeout and diskRetryDelay are specified). Allows caller to specify
   additional options. Does not raise an exception on error.
@@ -1483,7 +1512,7 @@ begin
     if ofCloseOnEOF in flags then
       options := options + [hfoCloseOnEOF];
     tfNo8BitCPConversion := ofNo8BitCPConversion in flags;
-    Result := ResetEx(1, bufferSize, diskLockTimeout, diskRetryDelay, options, waitObject);
+    Result := inherited ResetEx(1, bufferSize, diskLockTimeout, diskRetryDelay, options, waitObject);
     if Result = hfOK then begin
       tfCFlags := [];
       if FileSize >= SizeOf(UCS4Char) then begin
@@ -1567,6 +1596,14 @@ begin
     raise EGpTextFile.CreateFmtHelp(sFailedToRewriteFile,[FileName],hcTFFailedToRewrite);
 end; { TGpTextFile.Rewrite }
 
+function TGpTextFile.RewriteEx(blockSize, bufferSize, diskLockTimeout,
+  diskRetryDelay: integer; options: THFOpenOptions;
+  waitObject: THandle): THFError;
+begin
+  Result := inherited RewriteEx(blockSize, bufferSize, diskLockTimeout,
+    diskRetryDelay, options, waitObject);
+end; { TGpTextFile.RewriteEx }
+
 {:Full form of Rewrite. Will retry if file is locked by another application (if
   diskLockTimeout and diskRetryDelay are specified). Allows caller to specify
   additional options. Does not raise an exception on error.
@@ -1606,7 +1643,7 @@ begin
     options := [hfoBuffered];
     if cfCompressed in flags then
       Include(options,hfoCompressed);
-    Result := RewriteEx(1, bufferSize, diskLockTimeout, diskRetryDelay, options, waitObject);
+    Result := inherited RewriteEx(1, bufferSize, diskLockTimeout, diskRetryDelay, options, waitObject);
     if Result = hfOK then begin
       Truncate;
       tfCFlags := flags;

@@ -6,10 +6,63 @@
 ///
 ///   Author            : Claude (Anthropic AI), Primoz Gabrijelcic
 ///   Creation date     : 2026-02-12
-///   Last modification : 2026-03-19
-///   Version           : 1.03
+///   Last modification : 2026-06-01
+///   Version           : 1.07
 ///</para><para>
 ///   History:
+///     1.07: 2026-06-01
+///       - Fixed use-after-free / double-free crash under concurrent Fire +
+///         rapid RegisterThread/UnregisterThread churn. RegisterThread opened
+///         the subscriber thread handle with THREAD_SET_CONTEXT only (enough
+///         for QueueUserAPC), but GetExitCodeThread requires
+///         THREAD_QUERY_INFORMATION. Without it GetExitCodeThread always failed,
+///         so DetectAndRemoveDeadThreads (and Destroy) took the failure branch
+///         and misclassified every *live* registered thread as dead, freeing its
+///         TThreadDispatchState while APCs were still in flight. The bug was
+///         dormant in normal use (dead-thread detection only runs when a dispatch
+///         fails) but lethal under high thread churn. Fix: open the handle with
+///         THREAD_SET_CONTEXT or THREAD_QUERY_INFORMATION.
+///     1.06: 2026-05-14
+///       - Fixed permanent leak when a subscriber thread terminates without
+///         calling UnregisterThread and without entering alertable wait. In
+///         that case the pending APC in the thread's queue never fires, so
+///         the AddRef from DispatchToBackgroundThread (the "APC ref") is
+///         never balanced. DetectAndRemoveDeadThreads and Destroy now detect
+///         this condition (APCSignaled=1 on a confirmed-dead thread) and
+///         release the APC ref together with the bus's initial ref via a new
+///         ReleaseRefs(count) helper that atomically subtracts both and calls
+///         Free when the count reaches zero. The <= 0 guard in ReleaseRefs
+///         also tolerates the edge case where the APC fired early (IsActive=
+///         false, releasing its own ref) but left APCSignaled=1 unreset,
+///         preventing a double-free in that scenario.
+///     1.05: 2026-05-11
+///       - Fixed remaining shutdown leak: a Fire in flight on a producer
+///         thread could complete its QueueUserAPC after UnregisterThread had
+///         already removed the state from FThreadStates, orphaning the APC's
+///         AddRef when the subscriber thread terminated without re-entering
+///         alertable wait. Fire now holds the read lock for the entire
+///         cross-thread dispatch loop so UnregisterThread's BeginWrite waits
+///         for in-flight dispatches to complete. Same-thread synchronous
+///         handlers are deferred and invoked after EndRead so they can call
+///         back into the bus without deadlocking on the non-recursive
+///         SRWLock. Dispatch order: same-thread handlers now run after all
+///         cross-thread dispatches in the same Fire call.
+///       - DetectAndRemoveDeadThreads now drains each dead thread's
+///         EventQueue before releasing the bus's ref. Defense in depth: if a
+///         dead thread's state survives the Release (pinned by an APC that
+///         was queued before the thread died and will never fire), its
+///         captured event records are still freed.
+///     1.04: 2026-05-04
+///       - Fixed shutdown memory leak when subscriber thread terminates with
+///         pending APCs (state, queued closures, and captured event records all
+///         leaked because the AddRef from QueueUserAPC was never balanced).
+///       - GetThreadState now AddRefs the returned state under the lock; Fire and
+///         Subscribe Release it after use. Closes a use-after-free race between
+///         Fire and UnregisterThread.
+///       - UnregisterThread drains pending APCs via SleepEx(0, true) before
+///         removing the thread state.
+///       - Destroy drains each thread state's EventQueue so captured event records
+///         (and their managed fields, e.g. IGpBuffer) are released.
 ///     1.03: 2026-03-19
 ///       - [DEBUG] UnregisterThread now raises an exception when the calling
 ///         thread was not previously registered.
@@ -93,6 +146,7 @@ type
         procedure Deactivate;  // Called by bus on shutdown; signals APCProc to exit early
         function  IsActive: boolean;  // APCProc checks this before processing the queue
         procedure Release;
+        procedure ReleaseRefs(count: integer);  // Atomically release count refs; free when total hits 0
       end;
 
       TSubscriptionList = class
@@ -213,6 +267,16 @@ begin
   if TInterlocked.Decrement(FRefCount) = 0 then
     Free;
 end; { TEventBus.TThreadDispatchState.Release }
+
+procedure TEventBus.TThreadDispatchState.ReleaseRefs(count: integer);
+begin
+  // Atomically subtract `count` refs and free when the total reaches zero.
+  // Using <= 0 rather than = 0 so that a stale APCSignaled=1 (set by an APC
+  // that fired early due to IsActive=false and released its ref, but did not
+  // reset APCSignaled) causes exactly one Free rather than a permanent leak.
+  if TInterlocked.Add(FRefCount, -count) <= 0 then
+    Free;
+end; { TEventBus.TThreadDispatchState.ReleaseRefs }
 
 { TEventSubscription }
 
@@ -344,6 +408,7 @@ end; { TEventBus.Create }
 destructor TEventBus.Destroy;
 var
   list : TSubscriptionList;
+  proc : TProc;
   state: TThreadDispatchState;
 begin
   for list in FSubscriptions.Values do
@@ -364,7 +429,31 @@ begin
 
   for state in FThreadStates.Values do begin
     state.Deactivate;  // Signal to any pending APCProc calls that bus is gone
-    state.Release;     // Release bus's ref; state freed here if no APCs pending
+    // Drain any queued closures so their captured records (and resources held by
+    // managed fields, e.g. IGpBuffer) are released even if the state itself is
+    // pinned by a never-firing APC's outstanding AddRef. PopTimeout=0 makes
+    // PopItem return wrTimeout immediately on empty queue. Do NOT call
+    // DoShutDown — once shut down, PopItem incorrectly returns wrSignaled with
+    // a default item on an empty queue (RTL behavior at PopItem in
+    // System.Generics.Collections.pas), which would spin forever.
+    while state.EventQueue.PopItem(proc) = wrSignaled do
+      ; // proc auto-released at next assignment / loop exit
+    // If the subscriber thread terminated without calling UnregisterThread and
+    // without entering alertable wait, its pending APC will never fire, leaving
+    // the AddRef from DispatchToBackgroundThread permanently unbalanced. Check
+    // the thread's exit code: if it is dead, reclaim the APC ref together with
+    // the bus's initial ref in one atomic operation. For live threads, leave
+    // FRefCount=1; the APC will fire when the thread next enters alertable wait
+    // (IsActive=false causes APCProc to exit early and release its ref via the
+    // finally block), at which point FRefCount drops to 0 and the state is freed.
+    var extraRefs := 0;
+    if TInterlocked.CompareExchange(state.APCSignaled, 0, 0) = 1 then begin
+      var exitCode: DWORD;
+      if not GetExitCodeThread(state.ThreadHandle, exitCode) or (exitCode <> STILL_ACTIVE) then
+        if TInterlocked.Exchange(state.APCSignaled, 0) = 1 then
+          extraRefs := 1;
+    end;
+    state.ReleaseRefs(1 + extraRefs);
   end;
   FreeAndNil(FThreadStates);
 
@@ -394,6 +483,7 @@ begin
   try
     if not FThreadStates.TryGetValue(threadID, Result) then
       raise Exception.CreateFmt('TEventBus.GetThreadState: Thread %d is not registered. Call RegisterThread before subscribing.', [threadID]);
+    Result.AddRef;
   finally FLock.EndRead; end;
 end; { TEventBus.GetThreadState }
 
@@ -429,7 +519,12 @@ begin
       Exit;
   finally FLock.EndRead; end;
 
-  threadHandle := DSiOpenThread(THREAD_SET_CONTEXT, false, threadID);
+  // THREAD_SET_CONTEXT is required by QueueUserAPC; THREAD_QUERY_INFORMATION is
+  // required by GetExitCodeThread (used by DetectAndRemoveDeadThreads/Destroy).
+  // Without the query right GetExitCodeThread fails, and dead-thread detection
+  // would misclassify every live thread as dead and free its state while APCs
+  // are still in flight (use-after-free / double-free under concurrent dispatch).
+  threadHandle := DSiOpenThread(THREAD_SET_CONTEXT or THREAD_QUERY_INFORMATION, false, threadID);
   if threadHandle = 0 then
     raise Exception.CreateFmt('TEventBus.RegisterThread: Failed to open thread handle for thread %d. OS error %d: %s',
       [threadID, Winapi.Windows.GetLastError, SysErrorMessage(Winapi.Windows.GetLastError)]);
@@ -469,6 +564,7 @@ begin
     if FThreadStates.TryGetValue(threadID, state) then begin
       state.Deactivate;  // Signal to any pending APCProc calls that bus is gone
       state.Release;     // Release bus's ref; state freed here if no APCs pending
+      SleepEx(0, true);  // Clean up pending APCs
       FThreadStates.Remove(threadID);
     end
     {$IFDEF DEBUG}
@@ -576,6 +672,7 @@ var
   exitCode   : DWORD;
   list       : TSubscriptionList;
   pair       : TPair<TThreadID, TThreadDispatchState>;
+  proc       : TProc;
   state      : TThreadDispatchState;
   threadID   : TThreadID;
 begin
@@ -602,7 +699,20 @@ begin
       for threadID in deadThreads do begin
         if FThreadStates.TryGetValue(threadID, state) then begin
           state.Deactivate;  // Signal to any pending APCProc calls that bus is gone
-          state.Release;     // Release bus's ref; state freed here if no APCs pending
+          // Drain queued closures so captured records (e.g. IGpBuffer) are
+          // freed even if the state itself is pinned by the APC ref below.
+          while state.EventQueue.PopItem(proc) = wrSignaled do
+            ;
+          // The thread is confirmed dead: any QueueUserAPC that succeeded will
+          // never deliver its APC (dead threads never enter alertable wait).
+          // If APCSignaled=1, the corresponding AddRef from DispatchToBackground-
+          // Thread has never been balanced. Release that ref together with the
+          // bus's initial ref in a single atomic subtraction so Free is called
+          // at most once regardless of whether the APC had already fired.
+          var extraRefs := 0;
+          if TInterlocked.Exchange(state.APCSignaled, 0) = 1 then
+            extraRefs := 1;
+          state.ReleaseRefs(1 + extraRefs);
           FThreadStates.Remove(threadID);
         end;
       end;
@@ -647,7 +757,9 @@ begin
     subscription.ThreadHandle := 0
   else begin
     state := GetThreadState(threadID);
-    subscription.ThreadHandle := state.ThreadHandle;
+    try
+      subscription.ThreadHandle := state.ThreadHandle;
+    finally state.Release; end;
   end;
 
   list.Add(subscription);
@@ -677,43 +789,59 @@ var
   sub           : TSubscriptionRecord;
   subscriptions : TArray<TSubscriptionRecord>;
   typeInfo      : PTypeInfo;
+  currentThread : TThreadID;
 begin
   typeInfo := System.TypeInfo(T);
+  currentThread := GetCurrentThreadId;
+  dispatchFailed := false;
 
-  // Keep read lock while accessing list to prevent it from being freed by UnsubscribeAll
+  // Hold the read lock for the entire cross-thread dispatch loop. This blocks
+  // UnregisterThread (which needs BeginWrite) from racing past a producer that
+  // has snapshotted the subscriber list but not yet completed QueueUserAPC.
+  // Without this, the AddRef from a late QueueUserAPC can be orphaned when the
+  // subscriber thread terminates before the APC fires. Same-thread subscribers
+  // are deferred and invoked after EndRead so handlers can freely call back
+  // into the bus without deadlocking on the non-recursive SRWLock.
   FLock.BeginRead;
   try
     if not FSubscriptions.TryGetValue(typeInfo, list) then
       Exit;
 
     subscriptions := list.GetActiveSubscriptions;
-  finally FLock.EndRead; end;
 
-  if Length(subscriptions) = 0 then
-    Exit;
-
-  dispatchFailed := false;
-
-  for sub in subscriptions do begin
-    // If firing on same thread as subscriber, call directly (synchronous)
-    if sub.ThreadID = GetCurrentThreadId then begin
-      TEventHandler<T>(sub.Handler)(eventData);
-    end
-    else if sub.ThreadID = MainThreadID then begin
-      DispatchToMainThread(MakeCallback<T>(TEventHandler<T>(sub.Handler), eventData));
-    end
-    else begin
-      try
-        state := GetThreadState(sub.ThreadID);
-        DispatchToBackgroundThread(state, MakeCallback<T>(TEventHandler<T>(sub.Handler), eventData));
-      except
-        on E: Exception do begin
-          dispatchFailed := true;
-          OutputDebugString(PChar(Format('TEventBus.Fire: Dispatch failed for thread %d: %s', [sub.ThreadID, E.Message])));
+    for sub in subscriptions do begin
+      if sub.ThreadID = currentThread then
+        Continue  // deferred: invoked after EndRead in subscription order
+      else if sub.ThreadID = MainThreadID then begin
+        DispatchToMainThread(MakeCallback<T>(TEventHandler<T>(sub.Handler), eventData));
+      end
+      else begin
+        try
+          // Inline of GetThreadState — SRWLock is non-recursive, so we cannot
+          // call the public helper (which would re-enter BeginRead) here.
+          if not FThreadStates.TryGetValue(sub.ThreadID, state) then begin
+            dispatchFailed := true;
+            Continue;
+          end;
+          state.AddRef;
+          try
+            DispatchToBackgroundThread(state, MakeCallback<T>(TEventHandler<T>(sub.Handler), eventData));
+          finally state.Release; end;
+        except
+          on E: Exception do begin
+            dispatchFailed := true;
+            OutputDebugString(PChar(Format('TEventBus.Fire: Dispatch failed for thread %d: %s', [sub.ThreadID, E.Message])));
+          end;
         end;
       end;
     end;
-  end;
+  finally FLock.EndRead; end;
+
+  // Same-thread synchronous dispatch: run outside the lock so handlers can
+  // safely call Fire / Subscribe / UnregisterThread on this bus.
+  for sub in subscriptions do
+    if sub.ThreadID = currentThread then
+      TEventHandler<T>(sub.Handler)(eventData);
 
   if dispatchFailed then
     DetectAndRemoveDeadThreads;
