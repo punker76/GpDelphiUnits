@@ -55,6 +55,7 @@ type
     [Test] procedure FileInfoSurvivesFolderDeletionDeferredFree;
     [Test] procedure FragmentationAcrossFatBlocksSurvivesCompact;
     [Test] procedure DeletingFolderContainingSubfolderDoesNotUseFreedName;
+    [Test] procedure DeletingSecondToLastEntryDoesNotStrandLastEntry;
   end;
 
 implementation
@@ -1078,6 +1079,54 @@ begin
     DeleteStorageFile(CStorageFile);
   end;
 end; { TGpStructuredStorageTests.DeletingFolderContainingSubfolderDoesNotUseFreedName }
+
+procedure TGpStructuredStorageTests.DeletingSecondToLastEntryDoesNotStrandLastEntry;
+const
+  CStorageFile = 'gss_test_secondtolastdelete.stg';
+var
+  data   : AnsiString;
+  storage: IGpStructuredStorage;
+  strFile: TStream;
+begin
+  // Regression for issue #25: TGpStructuredStream.GetSize used floor division
+  // (ssStorage.Size div CBlockSize) to report the storage size in blocks. When the last
+  // allocated block is only partially filled (the usual case for a small file, since the
+  // underlying stream isn't padded out to a full block), that undercounts by one block.
+  // TGpStructuredFAT.Truncate (run on Close) then treats "GetSize-1" as the index of the
+  // last block; when the entry that was actually second-to-last had just been deleted (so
+  // its block is free), the off-by-one match caused Truncate to shrink the storage right
+  // through the still-live last block, stranding it past the truncated end of file.
+  //
+  // Two conditions are both required to trigger it: the deleted entry must be the
+  // second-to-last (second-highest block number), and the surviving last entry's data must
+  // not exactly fill its final block (so the on-disk size isn't a block multiple).
+  data := 'nine byte'; // 9 bytes: leaves the last block partially filled
+  try
+    storage := CreateStructuredStorage;
+    storage.Initialize(CStorageFile, fmCreate);
+    strFile := storage.OpenFile('/file0', fmCreate);
+    try strFile.Write(data[1], Length(data)); finally FreeAndNil(strFile); end;
+    strFile := storage.OpenFile('/file1', fmCreate);
+    try strFile.Write(data[1], Length(data)); finally FreeAndNil(strFile); end;
+    storage.Delete('/file0'); // delete the second-to-last entry
+    storage := nil;           // close -> Truncate must not strand /file1's block
+
+    storage := CreateStructuredStorage;
+    storage.Initialize(CStorageFile, fmOpenReadWrite);
+    Assert.IsTrue(storage.FileExists('/file1'), '/file1 should have survived the close/reopen');
+    strFile := storage.OpenFile('/file1', fmOpenRead);
+    try
+      Assert.AreEqual(int64(Length(data)), strFile.Size, '/file1 size should be unaffected');
+      SetLength(data, 0);
+      SetLength(data, strFile.Size);
+      strFile.Read(data[1], strFile.Size);
+      Assert.AreEqual('nine byte', string(data), '/file1 content should not be corrupted');
+    finally FreeAndNil(strFile); end;
+  finally
+    storage := nil;
+    DeleteStorageFile(CStorageFile);
+  end;
+end; { TGpStructuredStorageTests.DeletingSecondToLastEntryDoesNotStrandLastEntry }
 
 initialization
   TDUnitX.RegisterTestFixture(TGpStructuredStorageTests);

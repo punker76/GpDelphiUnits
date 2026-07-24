@@ -33,10 +33,20 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
    Author            : Primoz Gabrijelcic
    Creation date     : 2003-11-10
-   Last modification : 2026-07-20
-   Version           : 2.0d
+   Last modification : 2026-07-24
+   Version           : 2.0e
 </pre>*)(*
    History:
+     2.0e: 2026-07-24
+       - Bug fixed: TGpStructuredStream.GetSize floor-divided the underlying stream's byte
+         size by CBlockSize, undercounting by one block whenever the highest allocated
+         block was only partially filled (the usual case for a small file, since data isn't
+         padded out to a full block). TGpStructuredFAT.Truncate (run on Close) then used
+         that undercount as the index of the last block; if the entry actually occupying
+         the second-to-last block had just been deleted, the off-by-one coincidentally
+         matched its now-free block, and Truncate shrank the storage right through the
+         still-live last block - stranding it past the truncated end of file and corrupting
+         it on next open. GetSize now rounds up.
      2.0d: 2026-07-20
        - Bug fixed: TGpStructuredFAT.Truncate could delete a non-trailing (mid-list) FAT
          block, desyncing the physical block-to-FAT-block mapping and truncating the
@@ -918,7 +928,7 @@ end; { TGpStructuredStream.GetPosition }
 }
 function TGpStructuredStream.GetSize: integer;
 begin
-  Result := ssStorage.Size div CBlockSize;  
+  Result := (ssStorage.Size + CBlockSize - 1) div CBlockSize;
 end; { TGpStructuredStream.GetSize }
 
 {:Copies 'numBytes' from the storage stream into the 'buffer' and returns number
